@@ -10,15 +10,17 @@ import (
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
-	"go.universe.tf/metallb/e2etest/pkg/executor"
-	"go.universe.tf/metallb/e2etest/pkg/netdev"
-	"go.universe.tf/metallb/internal/ipfamily"
-	"go.universe.tf/metallb/internal/k8s/nodes"
+	. "github.com/onsi/gomega"
+	"go.universe.tf/e2etest/pkg/executor"
+	"go.universe.tf/e2etest/pkg/ipfamily"
+	"go.universe.tf/e2etest/pkg/netdev"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubectl/pkg/drain"
 )
 
 func NodeIPsForFamily(nodes []v1.Node, family ipfamily.Family, vrfName string) ([]string, error) {
@@ -82,20 +84,20 @@ func SelectorsForNodes(nodes []v1.Node) []metav1.LabelSelector {
 
 func AddLabelToNode(nodeName, key, value string, cs clientset.Interface) {
 	nodeObject, err := cs.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	framework.ExpectNoError(err)
+	Expect(err).NotTo(HaveOccurred())
 
 	nodeObject.Labels[key] = value
 	_, err = cs.CoreV1().Nodes().Update(context.Background(), nodeObject, metav1.UpdateOptions{})
-	framework.ExpectNoError(err)
+	Expect(err).NotTo(HaveOccurred())
 }
 
 func RemoveLabelFromNode(nodeName, key string, cs clientset.Interface) {
 	nodeObject, err := cs.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	framework.ExpectNoError(err)
+	Expect(err).NotTo(HaveOccurred())
 
 	delete(nodeObject.Labels, key)
 	_, err = cs.CoreV1().Nodes().Update(context.Background(), nodeObject, metav1.UpdateOptions{})
-	framework.ExpectNoError(err)
+	Expect(err).NotTo(HaveOccurred())
 }
 
 // SetNodeCondition sets the node's condition to the desired status and validates that the change is applied.
@@ -116,7 +118,7 @@ func SetNodeCondition(cs clientset.Interface, nodeName string, conditionType v1.
 		return fmt.Errorf("failed to set condition %s on node %s: %s", conditionType, nodeName, err)
 	}
 
-	gomega.Eventually(func() error {
+	Eventually(func() error {
 		patch := []byte(fmt.Sprintf(`{"status":{"conditions":%s}}`, raw))
 		_, err = cs.CoreV1().Nodes().PatchStatus(context.Background(), nodeName, patch)
 		if err != nil {
@@ -128,13 +130,76 @@ func SetNodeCondition(cs clientset.Interface, nodeName string, conditionType v1.
 			return fmt.Errorf("failed to get node %s: %s", nodeName, err)
 		}
 
-		gotStatus := nodes.ConditionStatus(n, conditionType)
+		gotStatus := conditionStatus(n, conditionType)
 		if status != gotStatus {
 			return fmt.Errorf("failed: got unexpected %s status on node %s", conditionType, nodeName)
 		}
 
 		return nil
-	}, time.Minute, 3*time.Second).ShouldNot(gomega.HaveOccurred())
+	}, time.Minute, 3*time.Second).ShouldNot(HaveOccurred())
 
 	return nil
+}
+
+func conditionStatus(n *corev1.Node, ct corev1.NodeConditionType) corev1.ConditionStatus {
+	if n == nil {
+		return corev1.ConditionUnknown
+	}
+
+	for _, c := range n.Status.Conditions {
+		if c.Type == ct {
+			return c.Status
+		}
+	}
+
+	return corev1.ConditionUnknown
+}
+
+func CordonNode(cs kubernetes.Interface, node *corev1.Node) error {
+
+	helper := &drain.Helper{
+		Client:              cs,
+		Ctx:                 context.TODO(),
+		Force:               true,
+		GracePeriodSeconds:  -1,
+		IgnoreAllDaemonSets: true,
+	}
+	if err := drain.RunCordonOrUncordon(helper, node, true); err != nil {
+		return fmt.Errorf("error cordoning node: %v", err)
+	}
+
+	return wait.PollUntilContextTimeout(context.Background(),
+		time.Second, 30*time.Second, false, func(context.Context) (bool, error) {
+			return IsNodeCordoned(cs, node)
+		})
+}
+
+func UnCordonNode(cs kubernetes.Interface, node *corev1.Node) error {
+
+	helper := &drain.Helper{
+		Client:              cs,
+		Ctx:                 context.TODO(),
+		Force:               true,
+		GracePeriodSeconds:  -1,
+		IgnoreAllDaemonSets: true,
+	}
+	if err := drain.RunCordonOrUncordon(helper, node, false); err != nil {
+		return fmt.Errorf("error cordoning node: %v", err)
+	}
+	return wait.PollUntilContextTimeout(context.Background(),
+		time.Second, 30*time.Second, false, func(context.Context) (bool, error) {
+			ret, err := IsNodeCordoned(cs, node)
+			if err != nil {
+				return false, err
+			}
+			return !ret, nil
+		})
+}
+
+func IsNodeCordoned(cs kubernetes.Interface, node *corev1.Node) (bool, error) {
+	o, err := cs.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return o.Spec.Unschedulable, nil
 }
